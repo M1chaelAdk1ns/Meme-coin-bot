@@ -1,0 +1,13 @@
+{
+  "name": "@meme-bot/core",
+  "version": "0.1.0",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -b"
+  },
+  "dependencies": {
+    "pino": "^9.1.0",
+    "zod": "^3.23.8"
+  }
+}

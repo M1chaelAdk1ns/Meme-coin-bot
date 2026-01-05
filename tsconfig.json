@@ -1,0 +1,15 @@
+{
+  "files": [],
+  "references": [
+    { "path": "packages/core" },
+    { "path": "packages/data" },
+    { "path": "packages/risk" },
+    { "path": "packages/strategy" },
+    { "path": "packages/exec" },
+    { "path": "packages/storage" },
+    { "path": "packages/alerts" },
+    { "path": "packages/telegram" },
+    { "path": "apps/runner" },
+    { "path": "apps/cli" }
+  ]
+}

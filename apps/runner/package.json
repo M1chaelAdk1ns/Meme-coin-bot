@@ -1,0 +1,20 @@
+{
+  "name": "@meme-bot/runner",
+  "version": "0.1.0",
+  "private": true,
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {"build": "tsc -b", "start": "ts-node src/index.ts"},
+  "dependencies": {
+    "@meme-bot/core": "^0.1.0",
+    "@meme-bot/data": "^0.1.0",
+    "@meme-bot/risk": "^0.1.0",
+    "@meme-bot/strategy": "^0.1.0",
+    "@meme-bot/exec": "^0.1.0",
+    "@meme-bot/storage": "^0.1.0",
+    "@meme-bot/alerts": "^0.1.0",
+    "@meme-bot/telegram": "^0.1.0",
+    "@solana/web3.js": "^1.95.3",
+    "uuid": "^9.0.1"
+  }
+}
