@@ -1,0 +1,18 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "include": ["src/**/*"],
+  "references": [
+    { "path": "../../packages/core" },
+    { "path": "../../packages/data" },
+    { "path": "../../packages/risk" },
+    { "path": "../../packages/strategy" },
+    { "path": "../../packages/exec" },
+    { "path": "../../packages/storage" },
+    { "path": "../../packages/alerts" },
+    { "path": "../../packages/telegram" }
+  ]
+}

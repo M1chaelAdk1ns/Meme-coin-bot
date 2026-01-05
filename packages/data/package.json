@@ -1,0 +1,11 @@
+{
+  "name": "@meme-bot/data",
+  "version": "0.1.0",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {"build": "tsc -b"},
+  "dependencies": {
+    "@meme-bot/core": "^0.1.0",
+    "ws": "^8.17.0"
+  }
+}
