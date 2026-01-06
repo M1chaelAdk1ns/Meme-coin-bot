@@ -7,6 +7,7 @@
     "build": "tsc -b"
   },
   "dependencies": {
+    "bs58": "^6.0.0",
     "pino": "^9.1.0",
     "zod": "^3.23.8"
   }
