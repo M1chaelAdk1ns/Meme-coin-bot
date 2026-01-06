@@ -1,5 +1,5 @@
 import WebSocket from 'ws';
-import { dedupeKey, logger, env } from '@meme-bot/core';
+import { dedupeKey, logger, env, RollingDedupe } from '@meme-bot/core';
 import { EventEmitter } from 'events';
 
 export type PumpPortalEvent =
@@ -8,7 +8,7 @@ export type PumpPortalEvent =
 
 export class PumpPortalClient extends EventEmitter {
   private ws?: WebSocket;
-  private dedupe = new Set<string>();
+  private dedupe = new RollingDedupe(6000);
   private heartbeat?: NodeJS.Timeout;
 
   constructor(private url: string = env.PUMP_PORTAL_URL) {
@@ -21,18 +21,22 @@ export class PumpPortalClient extends EventEmitter {
 
   private connect(retry = 0) {
     this.ws = new WebSocket(this.url);
+
     this.ws.on('open', () => {
       logger.info({ url: this.url }, 'pump portal connected');
       this.subscribeNewToken();
       this.emit('connected');
       this.startHeartbeat();
     });
+
     this.ws.on('message', (buf) => this.handleMessage(buf.toString()));
+
     this.ws.on('close', () => {
       logger.warn('pump portal connection closed, retrying');
       this.stopHeartbeat();
       setTimeout(() => this.connect(retry + 1), Math.min(5000 * (retry + 1), 15000));
     });
+
     this.ws.on('error', (err) => {
       logger.error({ err }, 'pump portal error');
       this.ws?.close();
@@ -62,12 +66,12 @@ export class PumpPortalClient extends EventEmitter {
   private handleMessage(raw: string) {
     try {
       const msg = JSON.parse(raw);
-      const key = dedupeKey([msg.signature || msg.mint, msg.slot || '']);
+
+      // Better dedupe key: signature + mint + slot + txType (when available)
+      const key = dedupeKey([msg.txType || '', msg.signature || '', msg.mint || '', msg.slot || '']);
       if (this.dedupe.has(key)) return;
       this.dedupe.add(key);
-      if (this.dedupe.size > 5000) {
-        this.dedupe = new Set(Array.from(this.dedupe).slice(-2000));
-      }
+
       if (msg.txType === 'create') {
         this.emit('event', { type: 'newToken', data: msg } satisfies PumpPortalEvent);
       } else if (msg.txType === 'trade') {
