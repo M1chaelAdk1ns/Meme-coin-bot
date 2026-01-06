@@ -1,5 +1,5 @@
 import { Connection, Keypair, PublicKey } from '@solana/web3.js';
-import { env, clamp, loadKeypair } from '@meme-bot/core';
+import { env, clamp, loadKeypair, runtimeFlags } from '@meme-bot/core';
 import { PumpPortalClient } from '@meme-bot/data';
 import { RiskEngine } from '@meme-bot/risk';
 import { StrategyEngine, LaunchMomentumStrategy, PullbackReclaimStrategy } from '@meme-bot/strategy';
@@ -76,6 +76,8 @@ async function handleNewToken(msg: any) {
 }
 
 async function considerEntry(mint: string) {
+  if (runtimeFlags.entriesPaused) return;
+
   const trades = tradesByMint.get(mint) || [];
   const prices = pricesByMint.get(mint) || [];
 
@@ -109,8 +111,22 @@ async function considerEntry(mint: string) {
   positions.set(pos.id, pos);
   alerts.notify('info', `Entering ${mint} size ${size.toFixed(2)} SOL (DRY_RUN=${env.DRY_RUN})`);
 
+  // DRY RUN or live disabled: just mark open
   if (env.DRY_RUN || !env.ENABLE_LIVE_TRADING) {
     fsm.transition(pos, 'OPEN');
+    return;
+  }
+
+  // Simulation gate (buy + sell) before real entry
+  const gate = await transactionEngine.simulateBuySellGate({
+    payer,
+    buildBuyTx: () => adapter.buildBuyTx({ payer: payer.publicKey, mint: new PublicKey(mint), amountSol: size }),
+    buildSellTx: () => adapter.buildSellTx({ payer: payer.publicKey, mint: new PublicKey(mint), amountSol: size * 0.2 })
+  });
+
+  if (!gate.ok) {
+    alerts.notify('warn', `Sim gate blocked ${mint}: ${gate.reason}`);
+    fsm.transition(pos, 'CLOSED');
     return;
   }
 
