@@ -9,15 +9,15 @@ import { env } from './config';
  * 2) KEYPAIR_PATH (JSON array from Solana CLI id.json)
  */
 export function loadKeypair(): Keypair {
-  if (env.KEYPAIR_B58) {
+  if (env.KEYPAIR_B58 && env.KEYPAIR_B58.trim().length > 0) {
     const secret = bs58.decode(env.KEYPAIR_B58.trim());
     return Keypair.fromSecretKey(secret);
   }
 
-  if (env.KEYPAIR_PATH) {
+  if (env.KEYPAIR_PATH && env.KEYPAIR_PATH.trim().length > 0) {
     const raw = fs.readFileSync(env.KEYPAIR_PATH, 'utf8');
     const arr = JSON.parse(raw);
-    if (!Array.isArray(arr)) throw new Error('KEYPAIR_PATH must point to a JSON array');
+    if (!Array.isArray(arr)) throw new Error('KEYPAIR_PATH must point to a JSON array (Solana id.json)');
     return Keypair.fromSecretKey(Uint8Array.from(arr));
   }
 
