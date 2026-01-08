@@ -169,7 +169,7 @@ async function considerEntry(mint: string) {
 
   if (!gate.ok) {
     alerts.notify('warn', `Sim gate blocked ${mint}: ${gate.reason}`);
-    fsm.transition(pos, 'CLOSED');
+    fsm.transition(pos, 'CLOSED', { error: gate.reason });
     openMints.delete(mint);
     return;
   }
@@ -186,10 +186,10 @@ async function considerEntry(mint: string) {
   );
 
   if (result.confirmed) {
-    fsm.transition(pos, 'OPEN');
+    fsm.transition(pos, 'OPEN', { entrySignature: result.signature });
   } else {
     alerts.notify('error', `Entry failed ${mint}: ${result.error}`);
-    fsm.transition(pos, 'CLOSED');
+    fsm.transition(pos, 'CLOSED', { error: result.error });
     openMints.delete(mint);
   }
 }
