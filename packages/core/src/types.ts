@@ -32,12 +32,12 @@ export type Position = {
   entryPrice?: number;
 
   entrySignature?: string;
+  exitSignature?: string;
   entryTimestamp?: number;
   lastError?: string;
 
-  // Exit tracking
-  tpFilled?: number;          // number of TP ladder steps already executed
-  peakPnlPct?: number;        // highest pnl% seen while open
+  tpFilled?: number;
+  peakPnlPct?: number;
 
   createdAt: number;
   updatedAt: number;
