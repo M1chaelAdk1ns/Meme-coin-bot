@@ -1,46 +1,78 @@
-import { Connection, PublicKey, Transaction, TransactionInstruction, ComputeBudgetProgram } from '@solana/web3.js';
+import { Connection, PublicKey, VersionedTransaction } from '@solana/web3.js';
 import { env } from '@meme-bot/core';
 
 export type PumpFunTradeParams = {
   payer: PublicKey;
   mint: PublicKey;
-  amountSol: number;
+
+  /**
+   * For BUY:
+   *  - amount: number (SOL)
+   *  - denominatedInSol: true
+   *
+   * For SELL:
+   *  - amount: number (token count) OR string percent like "10%" / "100%"
+   *  - denominatedInSol: false
+   */
+  amount: number | string;
+  denominatedInSol: boolean;
+
+  slippagePct?: number;
+  priorityFeeSol?: number;
+  pool?: string; // keep string so PumpPortal can support more without code changes
 };
 
 export class PumpFunAdapter {
   constructor(private connection: Connection) {}
 
-  async buildBuyTx(params: PumpFunTradeParams): Promise<Transaction> {
-    const ix: TransactionInstruction = new TransactionInstruction({
-      programId: new PublicKey('11111111111111111111111111111111'), // TODO real pump.fun program
-      keys: [],
-      data: Buffer.from([])
+  private async buildPortalTx(params: PumpFunTradeParams, action: 'buy' | 'sell'): Promise<VersionedTransaction> {
+    const body = {
+      publicKey: params.payer.toBase58(),
+      action,
+      mint: params.mint.toBase58(),
+      amount: params.amount,
+      denominatedInSol: params.denominatedInSol ? 'true' : 'false',
+      slippage: params.slippagePct ?? env.PORTAL_SLIPPAGE_PCT,
+      priorityFee: params.priorityFeeSol ?? env.PORTAL_PRIORITY_FEE_SOL,
+      pool: params.pool ?? env.PORTAL_POOL
+    };
+
+    const resp = await fetch(env.PUMP_TRADE_LOCAL_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
     });
-    const tx = new Transaction();
-    tx.add(
-      ComputeBudgetProgram.setComputeUnitLimit({ units: env.COMPUTE_UNIT_LIMIT }),
-      ComputeBudgetProgram.setComputeUnitPrice({ microLamports: env.PRIORITY_FEE_MICRO_LAMPORTS }),
-      ix
-    );
-    tx.feePayer = params.payer;
-    tx.recentBlockhash = (await this.connection.getLatestBlockhash()).blockhash;
-    return tx;
+
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => '');
+      throw new Error(`trade-local failed (${resp.status}): ${text || resp.statusText}`);
+    }
+
+    const buf = new Uint8Array(await resp.arrayBuffer());
+    return VersionedTransaction.deserialize(buf);
   }
 
-  async buildSellTx(params: PumpFunTradeParams): Promise<Transaction> {
-    const ix: TransactionInstruction = new TransactionInstruction({
-      programId: new PublicKey('11111111111111111111111111111111'), // TODO real pump.fun program
-      keys: [],
-      data: Buffer.from([])
-    });
-    const tx = new Transaction();
-    tx.add(
-      ComputeBudgetProgram.setComputeUnitLimit({ units: env.COMPUTE_UNIT_LIMIT }),
-      ComputeBudgetProgram.setComputeUnitPrice({ microLamports: env.PRIORITY_FEE_MICRO_LAMPORTS }),
-      ix
+  async buildBuyTx(params: PumpFunTradeParams): Promise<VersionedTransaction> {
+    // Force BUY to be SOL-denominated
+    return this.buildPortalTx(
+      {
+        ...params,
+        denominatedInSol: true,
+        pool: params.pool ?? env.PORTAL_POOL
+      },
+      'buy'
     );
-    tx.feePayer = params.payer;
-    tx.recentBlockhash = (await this.connection.getLatestBlockhash()).blockhash;
-    return tx;
+  }
+
+  async buildSellTx(params: PumpFunTradeParams): Promise<VersionedTransaction> {
+    // SELL: default to token-denominated. Most common safe call is percent like "10%" or "100%"
+    return this.buildPortalTx(
+      {
+        ...params,
+        denominatedInSol: false,
+        pool: params.pool ?? env.PORTAL_POOL
+      },
+      'sell'
+    );
   }
 }
