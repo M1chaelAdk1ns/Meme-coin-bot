@@ -4,7 +4,6 @@ export type RiskReport = {
   reasons: string[];
   dataCompleteness: 'low' | 'medium' | 'high';
 
-  // Optional structured fields for debugging / analytics (safe to ignore)
   category?: 'ok' | 'scam' | 'honeypot_suspected' | 'low_liquidity' | 'whale_risk' | 'unknown';
   metrics?: Record<string, number | string | boolean>;
 };
@@ -27,17 +26,18 @@ export type Position = {
   mint: string;
   state: PositionState;
 
-  // Intended risk/exposure at entry time
   sizeSol: number;
 
-  // Filled state (set once we implement fill + exit management)
   tokens?: number;
   entryPrice?: number;
 
-  // Execution metadata (helps with audits/debugging)
   entrySignature?: string;
   entryTimestamp?: number;
   lastError?: string;
+
+  // Exit tracking
+  tpFilled?: number;          // number of TP ladder steps already executed
+  peakPnlPct?: number;        // highest pnl% seen while open
 
   createdAt: number;
   updatedAt: number;
