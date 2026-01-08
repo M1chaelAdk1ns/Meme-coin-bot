@@ -43,7 +43,7 @@ const lastExitActionByMint = new Map<string, number>();
 const EXIT_COOLDOWN_MS = 1200;
 
 // Trailing giveback (simple, effective): if peak pnl was high then dumps hard, exit remainder
-const TRAIL_GIVEBACK_PCT = 0.20; // 20% absolute giveback (ex: peak +0.70 then falls to +0.50 => exit)
+const TRAIL_GIVEBACK_PCT = 0.20;
 
 function recordTrade(event: TradeEvent) {
   const arr = tradesByMint.get(event.mint) || [];
@@ -64,6 +64,43 @@ function refreshOpenMintsFromDb() {
     openMints.add(p.mint);
     positions.set(p.id, p);
   }
+}
+
+function currentExposureSol(): number {
+  // simple exposure approximation: sum sizeSol of non-closed positions
+  // (good enough for now; later we’ll switch to remaining size after partial TPs)
+  const open = storage.listOpenPositions().filter((p) => p.state !== 'CLOSED');
+  return open.reduce((acc, p) => acc + (Number(p.sizeSol) || 0), 0);
+}
+
+async function canEnterProposed(sizeSol: number): Promise<{ ok: boolean; reason?: string }> {
+  if (openMints.size >= env.MAX_OPEN_POSITIONS) {
+    return { ok: false, reason: `Max open positions reached (${env.MAX_OPEN_POSITIONS})` };
+  }
+
+  const exposure = currentExposureSol();
+  if (exposure + sizeSol > env.MAX_TOTAL_EXPOSURE_SOL) {
+    return {
+      ok: false,
+      reason: `Exposure cap: current ${exposure.toFixed(2)} SOL + new ${sizeSol.toFixed(2)} SOL > ${env.MAX_TOTAL_EXPOSURE_SOL.toFixed(2)} SOL`
+    };
+  }
+
+  // Only check wallet balance when live trading could actually spend SOL
+  if (!env.DRY_RUN && env.ENABLE_LIVE_TRADING) {
+    const conn = connections[0];
+    const balLamports = await conn.getBalance(payer.publicKey, 'confirmed');
+    const balSol = balLamports / 1e9;
+
+    if (balSol - sizeSol < env.MIN_SOL_BALANCE) {
+      return {
+        ok: false,
+        reason: `Wallet guard: balance ${balSol.toFixed(4)} SOL, trade ${sizeSol.toFixed(2)} SOL would drop below MIN_SOL_BALANCE=${env.MIN_SOL_BALANCE}`
+      };
+    }
+  }
+
+  return { ok: true };
 }
 
 async function assertWalletReady() {
@@ -144,7 +181,6 @@ async function manageExitsTick() {
 
     let dirty = false;
 
-    // ensure we have an entry price (first tick after OPEN)
     if (!pos.entryPrice) {
       pos.entryPrice = px;
       storage.savePosition(pos);
@@ -154,7 +190,6 @@ async function manageExitsTick() {
     const pnl = pnlPct(pos, px);
     if (pnl === undefined) continue;
 
-    // peak tracking
     const prevPeak = typeof pos.peakPnlPct === 'number' ? pos.peakPnlPct : undefined;
     const peakBase = typeof prevPeak === 'number' ? prevPeak : pnl;
     if (pnl > peakBase) {
@@ -162,7 +197,6 @@ async function manageExitsTick() {
       dirty = true;
     }
 
-    // time stop
     const openTs = pos.entryTimestamp ?? pos.createdAt;
     const ageSec = (Date.now() - openTs) / 1000;
     if (ageSec >= env.TIME_STOP_SEC) {
@@ -184,7 +218,6 @@ async function manageExitsTick() {
       continue;
     }
 
-    // stop loss
     if (pnl <= -pos.stopLossPct) {
       const last = lastExitActionByMint.get(pos.mint) || 0;
       if (Date.now() - last < EXIT_COOLDOWN_MS) continue;
@@ -204,7 +237,6 @@ async function manageExitsTick() {
       continue;
     }
 
-    // trailing giveback (only after meaningful profit)
     const peakNow = typeof pos.peakPnlPct === 'number' ? pos.peakPnlPct : pnl;
     if (peakNow >= 0.35 && peakNow - pnl >= TRAIL_GIVEBACK_PCT) {
       const last = lastExitActionByMint.get(pos.mint) || 0;
@@ -228,13 +260,12 @@ async function manageExitsTick() {
       continue;
     }
 
-    // TP ladder
     const tpFilled = pos.tpFilled ?? 0;
     const ladder = pos.takeProfits ?? [];
     const next = ladder[tpFilled];
 
     if (next) {
-      const target = next.profit; // pnl threshold, e.g. 0.3 = +30%
+      const target = next.profit;
       if (pnl >= target) {
         const last = lastExitActionByMint.get(pos.mint) || 0;
         if (Date.now() - last < EXIT_COOLDOWN_MS) continue;
@@ -259,9 +290,7 @@ async function manageExitsTick() {
       }
     }
 
-    if (dirty) {
-      storage.savePosition(pos);
-    }
+    if (dirty) storage.savePosition(pos);
   }
 }
 
@@ -294,6 +323,13 @@ async function considerEntry(mint: string) {
 
   const size = clamp(env.BASE_SIZE_SOL * signal.sizeMultiplier, 0.1, env.MAX_TRADE_SOL);
 
+  // 🔒 Hard risk gates (positions/exposure/wallet)
+  const gate = await canEnterProposed(size);
+  if (!gate.ok) {
+    alerts.notify('warn', `Entry blocked ${mint}: ${gate.reason}`);
+    return;
+  }
+
   const pos = fsm.create(
     mint,
     size,
@@ -302,7 +338,6 @@ async function considerEntry(mint: string) {
     env.TRAIL_MODE
   );
 
-  // fallback entry price from last portal price (will be overwritten by real fill if available)
   const entryPxFallback = prices.length ? prices[prices.length - 1] : undefined;
   if (entryPxFallback) pos.entryPrice = entryPxFallback;
 
@@ -318,7 +353,7 @@ async function considerEntry(mint: string) {
 
   const mintPk = new PublicKey(mint);
 
-  const gate = await transactionEngine.simulateBuySellGate({
+  const simGate = await transactionEngine.simulateBuySellGate({
     payer,
     buildBuyTx: () =>
       adapter.buildBuyTx({
@@ -336,14 +371,13 @@ async function considerEntry(mint: string) {
       })
   });
 
-  if (!gate.ok) {
-    alerts.notify('warn', `Sim gate blocked ${mint}: ${gate.reason}`);
-    fsm.transition(pos, 'CLOSED', { error: gate.reason });
+  if (!simGate.ok) {
+    alerts.notify('warn', `Sim gate blocked ${mint}: ${simGate.reason}`);
+    fsm.transition(pos, 'CLOSED', { error: simGate.reason });
     openMints.delete(mint);
     return;
   }
 
-  // Send buy, then fetch real deltas
   const { exec, fill } = await transactionEngine.sendWithRetryAndFetchFill({
     txBuilder: () =>
       adapter.buildBuyTx({
@@ -358,12 +392,9 @@ async function considerEntry(mint: string) {
   });
 
   if (exec.confirmed && exec.signature) {
-    // Try to compute accurate fill
     if (fill?.ok) {
       const tokens = typeof fill.tokenDelta === 'number' ? fill.tokenDelta : undefined;
       const solDelta = typeof fill.solDelta === 'number' ? fill.solDelta : undefined;
-
-      // solDelta is post - pre; for a buy it should be negative (spent)
       const solSpent = typeof solDelta === 'number' ? -solDelta : undefined;
 
       if (tokens && tokens > 0 && solSpent && solSpent > 0) {
@@ -428,7 +459,6 @@ function startFeed() {
   pump.start();
 }
 
-// Telegram /status wiring
 telegram.start(async () => {
   const conn = connections[0];
   const balLamports = await conn.getBalance(payer.publicKey, 'confirmed');
@@ -445,7 +475,6 @@ telegram.start(async () => {
 (async () => {
   await assertWalletReady();
 
-  // Exit manager loop
   setInterval(() => {
     void manageExitsTick().catch((e) => {
       alerts.notify('error', `exit manager error: ${e?.message || e}`);
