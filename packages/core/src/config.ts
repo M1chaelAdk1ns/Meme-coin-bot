@@ -32,24 +32,26 @@ const envSchema = z.object({
   // Storage
   SQLITE_PATH: z.string().default('bot.db'),
 
-  // Execution tuning
+  // Execution tuning (ComputeBudget for any legacy tx you build yourself)
   PRIORITY_FEE_MICRO_LAMPORTS: z.string().default('5000'),
   COMPUTE_UNIT_LIMIT: z.string().default('1200000'),
   JITO_ENABLED: z.string().default('false'),
 
+  // PumpPortal / pump.fun tx generation (trade-local)
+  PUMP_PORTAL_URL: z.string().default('wss://pumpportal.fun/api/data'),
+  PUMP_TRADE_LOCAL_URL: z.string().default('https://pumpportal.fun/api/trade-local'),
+  PORTAL_SLIPPAGE_PCT: z.string().default('10'),
+  PORTAL_PRIORITY_FEE_SOL: z.string().default('0.00001'),
+  PORTAL_POOL: z.string().default('pump'), // enforce pump-only entries
+
   // Logging
   LOG_LEVEL: z.string().default('info'),
-
-  // Data feeds
-  PUMP_PORTAL_URL: z.string().default('wss://pumpportal.fun/api/data'),
 });
 
 export const rawEnv = envSchema.parse(process.env);
 
 export const env = {
-  RPC_URLS: rawEnv.RPC_URLS.split(',')
-    .map((s) => s.trim())
-    .filter(Boolean),
+  RPC_URLS: rawEnv.RPC_URLS.split(',').map((s) => s.trim()).filter(Boolean),
 
   ENABLE_LIVE_TRADING: rawEnv.ENABLE_LIVE_TRADING === 'true',
   DRY_RUN: rawEnv.DRY_RUN !== 'false',
@@ -76,7 +78,11 @@ export const env = {
   COMPUTE_UNIT_LIMIT: Number(rawEnv.COMPUTE_UNIT_LIMIT),
   JITO_ENABLED: rawEnv.JITO_ENABLED === 'true',
 
-  LOG_LEVEL: rawEnv.LOG_LEVEL,
-
   PUMP_PORTAL_URL: rawEnv.PUMP_PORTAL_URL,
+  PUMP_TRADE_LOCAL_URL: rawEnv.PUMP_TRADE_LOCAL_URL,
+  PORTAL_SLIPPAGE_PCT: Number(rawEnv.PORTAL_SLIPPAGE_PCT),
+  PORTAL_PRIORITY_FEE_SOL: Number(rawEnv.PORTAL_PRIORITY_FEE_SOL),
+  PORTAL_POOL: rawEnv.PORTAL_POOL,
+
+  LOG_LEVEL: rawEnv.LOG_LEVEL,
 };
