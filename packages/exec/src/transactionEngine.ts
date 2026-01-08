@@ -1,18 +1,35 @@
 import {
-  Commitment,
   Connection,
   Keypair,
   SendOptions,
   Transaction,
-  TransactionSignature
+  TransactionSignature,
+  VersionedTransaction
 } from '@solana/web3.js';
-import { env, logger, ExecutionResult, sleep } from '@meme-bot/core';
+import { ExecutionResult, logger, sleep } from '@meme-bot/core';
+
+export type AnyTx = Transaction | VersionedTransaction;
 
 export type SimResult = {
   ok: boolean;
   err?: string;
   logs?: string[];
 };
+
+function signTx(tx: AnyTx, payer: Keypair) {
+  if (tx instanceof Transaction) {
+    tx.sign(payer);
+    return;
+  }
+  tx.sign([payer]);
+}
+
+function serializeTx(tx: AnyTx): Uint8Array {
+  if (tx instanceof Transaction) {
+    return tx.serialize();
+  }
+  return tx.serialize();
+}
 
 export class TransactionEngine {
   private rpcIndex = 0;
@@ -24,61 +41,41 @@ export class TransactionEngine {
     return this.connections[this.rpcIndex];
   }
 
-  /**
-   * Simulate a transaction on a connection with conservative settings.
-   * IMPORTANT: the transaction should already have feePayer + recentBlockhash set.
-   */
-  async simulate(tx: Transaction, connection: Connection = this.connections[0]): Promise<SimResult> {
+  async simulate(tx: AnyTx, connection: Connection = this.connections[0]): Promise<SimResult> {
     try {
-      const res = await connection.simulateTransaction(tx, {
+      const res = await connection.simulateTransaction(tx as any, {
         sigVerify: false,
         commitment: 'processed'
       });
-      if (res.value.err) {
-        return { ok: false, err: JSON.stringify(res.value.err), logs: res.value.logs ?? undefined };
-      }
+      if (res.value.err) return { ok: false, err: JSON.stringify(res.value.err), logs: res.value.logs ?? undefined };
       return { ok: true, logs: res.value.logs ?? undefined };
     } catch (e: any) {
       return { ok: false, err: e?.message || String(e) };
     }
   }
 
-  /**
-   * Simulation gate: simulate BUY then simulate SELL (small amount) before allowing entry.
-   * You pass builders so we can rebuild with fresh blockhash if needed.
-   */
   async simulateBuySellGate(params: {
-    buildBuyTx: () => Promise<Transaction>;
-    buildSellTx: () => Promise<Transaction>;
+    buildBuyTx: () => Promise<AnyTx>;
+    buildSellTx: () => Promise<AnyTx>;
     payer: Keypair;
     connection?: Connection;
   }): Promise<{ ok: boolean; reason?: string; buy?: SimResult; sell?: SimResult }> {
     const connection = params.connection ?? this.connections[0];
 
-    // Sim BUY
     const buyTx = await params.buildBuyTx();
-    buyTx.sign(params.payer);
+    signTx(buyTx, params.payer);
     const buySim = await this.simulate(buyTx, connection);
-    if (!buySim.ok) {
-      return { ok: false, reason: `BUY simulation failed: ${buySim.err}`, buy: buySim };
-    }
+    if (!buySim.ok) return { ok: false, reason: `BUY simulation failed: ${buySim.err}`, buy: buySim };
 
-    // Sim SELL
     const sellTx = await params.buildSellTx();
-    sellTx.sign(params.payer);
+    signTx(sellTx, params.payer);
     const sellSim = await this.simulate(sellTx, connection);
-    if (!sellSim.ok) {
-      return { ok: false, reason: `SELL simulation failed: ${sellSim.err}`, buy: buySim, sell: sellSim };
-    }
+    if (!sellSim.ok) return { ok: false, reason: `SELL simulation failed: ${sellSim.err}`, buy: buySim, sell: sellSim };
 
     return { ok: true, buy: buySim, sell: sellSim };
   }
 
-  /**
-   * Sends with retry ladder. Fixes confirmation to use the SAME blockhash context
-   * that the tx was built with.
-   */
-  async sendWithRetry(txBuilder: () => Promise<Transaction>, payer: Keypair): Promise<ExecutionResult> {
+  async sendWithRetry(txBuilder: () => Promise<AnyTx>, payer: Keypair): Promise<ExecutionResult> {
     let attempt = 0;
     let lastError: string | undefined;
 
@@ -86,41 +83,23 @@ export class TransactionEngine {
       attempt += 1;
 
       try {
-        // RPC selection: first attempt primary; later attempts may rotate.
         const connection = attempt === 1 ? this.connections[0] : this.nextConnection();
-
-        // Build fresh tx each attempt (fresh blockhash, fresh CU price, etc.)
         const tx = await txBuilder();
 
-        // Capture blockhash context used by THIS tx
-        const blockhash = tx.recentBlockhash;
-        // If builder forgot to set it, we set it here
-        if (!blockhash) {
-          const bh = await connection.getLatestBlockhash('processed');
-          tx.recentBlockhash = bh.blockhash;
-        }
-
-        // Ensure fee payer
-        if (!tx.feePayer) tx.feePayer = payer.publicKey;
-
-        tx.sign(payer);
-        const raw = tx.serialize();
+        // sign + send
+        signTx(tx, payer);
+        const raw = serializeTx(tx);
 
         const opts: SendOptions = {
           skipPreflight: false,
-          maxRetries: 0, // we do our own retry ladder
+          maxRetries: 0,
           preflightCommitment: 'processed'
         };
 
         const sig: TransactionSignature = await connection.sendRawTransaction(raw, opts);
 
-        // Confirm using the tx’s blockhash context
+        // best-effort confirm
         const bh = await connection.getLatestBlockhash('processed');
-        // If txBuilder used a blockhash, we should confirm against its lastValidBlockHeight
-        // but we don't have that without passing it through. So we do best-effort confirm:
-        // - confirmTransaction(signature, commitment) is deprecated; use blockhash strategy.
-        // We'll confirm with the most recent blockhash context but also check signature status.
-        // NOTE: We'll improve this further once txBuilder returns the blockhash context.
         const status = await connection.confirmTransaction(
           { signature: sig, blockhash: bh.blockhash, lastValidBlockHeight: bh.lastValidBlockHeight },
           'confirmed'
@@ -136,8 +115,6 @@ export class TransactionEngine {
       } catch (err: any) {
         lastError = err?.message || String(err);
         logger.warn({ attempt, err: lastError }, 'send attempt failed');
-
-        // Small backoff so we don’t hammer on the same blockhash window
         await sleep(150 * attempt);
       }
     }
