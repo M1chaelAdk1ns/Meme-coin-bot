@@ -1,5 +1,5 @@
 import { Telegraf } from 'telegraf';
-import { env, logger } from '@meme-bot/core';
+import { env, logger, runtimeFlags } from '@meme-bot/core';
 
 export type StatusSnapshot = {
   wallet?: string;
@@ -39,10 +39,11 @@ export class TelegramBot {
       const lines = [
         `DRY_RUN: ${s.dryRun}`,
         `LIVE ENABLED: ${s.liveEnabled}`,
+        `Entries paused: ${runtimeFlags.entriesPaused}`,
         s.wallet ? `Wallet: ${s.wallet}` : undefined,
         typeof s.balanceSol === 'number' ? `Balance: ${s.balanceSol.toFixed(4)} SOL` : undefined,
         `Open positions: ${s.openPositions}`,
-        typeof s.feedConnected === 'boolean' ? `Feed connected: ${s.feedConnected}` : undefined,
+        typeof s.feedConnected === 'boolean' ? `Feed connected: ${s.feedConnected}` : undefined
       ].filter(Boolean);
 
       return ctx.reply(lines.join('\n'));
@@ -50,13 +51,35 @@ export class TelegramBot {
 
     this.bot.command('config', (ctx) =>
       ctx.reply(
-        `DRY_RUN: ${env.DRY_RUN}\nLIVE: ${env.ENABLE_LIVE_TRADING}\nBase: ${env.BASE_SIZE_SOL} SOL\nMax trade: ${env.MAX_TRADE_SOL} SOL`
+        [
+          `DRY_RUN: ${env.DRY_RUN}`,
+          `LIVE: ${env.ENABLE_LIVE_TRADING}`,
+          `Base: ${env.BASE_SIZE_SOL} SOL`,
+          `Max trade: ${env.MAX_TRADE_SOL} SOL`,
+          `PumpPortal trade-local: ${env.PUMP_TRADE_LOCAL_URL}`,
+          `Pool: ${env.PORTAL_POOL}`,
+          `Slippage: ${env.PORTAL_SLIPPAGE_PCT}%`,
+          `Priority fee: ${env.PORTAL_PRIORITY_FEE_SOL} SOL`
+        ].join('\n')
       )
     );
 
-    // Not wired yet — we’ll wire these to a shared “pause” flag next
-    this.bot.command('pause_entries', (ctx) => ctx.reply('Entries paused (not yet wired).'));
-    this.bot.command('resume_entries', (ctx) => ctx.reply('Entries resumed (not yet wired).'));
+    this.bot.command('pause_entries', (ctx) => {
+      runtimeFlags.entriesPaused = true;
+      return ctx.reply('✅ Entries paused.');
+    });
+
+    this.bot.command('resume_entries', (ctx) => {
+      runtimeFlags.entriesPaused = false;
+      return ctx.reply('✅ Entries resumed.');
+    });
+
+    // Panic = immediately stop new entries.
+    // (We’ll add "close all positions" once sell/exit management is implemented.)
+    this.bot.command('panic', (ctx) => {
+      runtimeFlags.entriesPaused = true;
+      return ctx.reply('🚨 PANIC: entries paused immediately.');
+    });
 
     this.bot.launch();
     logger.info('telegram bot started');
