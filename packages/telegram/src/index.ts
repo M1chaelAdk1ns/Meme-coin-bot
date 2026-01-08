@@ -10,6 +10,10 @@ export type StatusSnapshot = {
   feedConnected?: boolean;
 };
 
+function fmtBool(b: boolean) {
+  return b ? 'YES' : 'NO';
+}
+
 export class TelegramBot {
   private bot?: Telegraf;
   private getStatus?: () => Promise<StatusSnapshot>;
@@ -26,60 +30,91 @@ export class TelegramBot {
     const admin = env.TELEGRAM_ADMIN_CHAT_ID;
 
     this.bot.use(async (ctx, next) => {
-      if (`${ctx.from?.id}` !== admin) return ctx.reply('unauthorized');
-      return next();
+      try {
+        if (`${ctx.from?.id}` !== admin) return ctx.reply('unauthorized');
+        return next();
+      } catch (e: any) {
+        logger.warn({ err: e?.message || String(e) }, 'telegram middleware error');
+        // best-effort reply
+        try {
+          return ctx.reply('Error handling request.');
+        } catch {
+          return;
+        }
+      }
     });
 
     this.bot.start((ctx) => ctx.reply('Pump.fun bot ready. Use /status'));
 
     this.bot.command('status', async (ctx) => {
-      if (!this.getStatus) return ctx.reply('Status provider not wired yet.');
-      const s = await this.getStatus();
+      try {
+        if (!this.getStatus) return ctx.reply('Status provider not wired yet.');
+        const s = await this.getStatus();
 
-      const lines = [
-        `DRY_RUN: ${s.dryRun}`,
-        `LIVE ENABLED: ${s.liveEnabled}`,
-        `Entries paused: ${runtimeFlags.entriesPaused}`,
-        s.wallet ? `Wallet: ${s.wallet}` : undefined,
-        typeof s.balanceSol === 'number' ? `Balance: ${s.balanceSol.toFixed(4)} SOL` : undefined,
-        `Open positions: ${s.openPositions}`,
-        typeof s.feedConnected === 'boolean' ? `Feed connected: ${s.feedConnected}` : undefined
-      ].filter(Boolean);
+        const lines = [
+          `DRY_RUN: ${fmtBool(s.dryRun)}`,
+          `LIVE ENABLED: ${fmtBool(s.liveEnabled)}`,
+          `Entries paused: ${fmtBool(runtimeFlags.entriesPaused)}`,
+          s.wallet ? `Wallet: ${s.wallet}` : undefined,
+          typeof s.balanceSol === 'number' ? `Balance: ${s.balanceSol.toFixed(4)} SOL` : undefined,
+          `Open positions: ${s.openPositions}`,
+          typeof s.feedConnected === 'boolean' ? `Feed connected: ${fmtBool(s.feedConnected)}` : undefined
+        ].filter(Boolean);
 
-      return ctx.reply(lines.join('\n'));
+        return ctx.reply(lines.join('\n'));
+      } catch (e: any) {
+        logger.warn({ err: e?.message || String(e) }, 'telegram /status error');
+        return ctx.reply('Failed to fetch status.');
+      }
     });
 
-    this.bot.command('config', (ctx) =>
-      ctx.reply(
-        [
-          `DRY_RUN: ${env.DRY_RUN}`,
-          `LIVE: ${env.ENABLE_LIVE_TRADING}`,
-          `Base: ${env.BASE_SIZE_SOL} SOL`,
-          `Max trade: ${env.MAX_TRADE_SOL} SOL`,
-          `PumpPortal trade-local: ${env.PUMP_TRADE_LOCAL_URL}`,
-          `Pool: ${env.PORTAL_POOL}`,
-          `Slippage: ${env.PORTAL_SLIPPAGE_PCT}%`,
-          `Priority fee: ${env.PORTAL_PRIORITY_FEE_SOL} SOL`
-        ].join('\n')
-      )
-    );
-
-    this.bot.command('pause_entries', (ctx) => {
-      runtimeFlags.entriesPaused = true;
-      return ctx.reply('✅ Entries paused.');
+    this.bot.command('config', async (ctx) => {
+      try {
+        return ctx.reply(
+          [
+            `DRY_RUN: ${fmtBool(env.DRY_RUN)}`,
+            `LIVE: ${fmtBool(env.ENABLE_LIVE_TRADING)}`,
+            `Entries paused: ${fmtBool(runtimeFlags.entriesPaused)}`,
+            `Base: ${env.BASE_SIZE_SOL} SOL`,
+            `Max trade: ${env.MAX_TRADE_SOL} SOL`,
+            `Max open: ${env.MAX_OPEN_POSITIONS}`,
+            `Max exposure: ${env.MAX_TOTAL_EXPOSURE_SOL} SOL`,
+            `Min balance: ${env.MIN_SOL_BALANCE} SOL`,
+            `PumpPortal trade-local: ${env.PUMP_TRADE_LOCAL_URL}`,
+            `Pool: ${env.PORTAL_POOL}`,
+            `Slippage: ${env.PORTAL_SLIPPAGE_PCT}%`,
+            `Priority fee: ${env.PORTAL_PRIORITY_FEE_SOL} SOL`
+          ].join('\n')
+        );
+      } catch (e: any) {
+        logger.warn({ err: e?.message || String(e) }, 'telegram /config error');
+        return ctx.reply('Failed to fetch config.');
+      }
     });
 
-    this.bot.command('resume_entries', (ctx) => {
-      runtimeFlags.entriesPaused = false;
-      return ctx.reply('✅ Entries resumed.');
-    });
+    const setEntriesPaused = async (ctx: any, paused: boolean, label: string) => {
+      try {
+        const before = runtimeFlags.entriesPaused;
+        runtimeFlags.entriesPaused = paused;
+
+        if (before === paused) {
+          return ctx.reply(`Entries already ${paused ? 'paused' : 'running'}.`);
+        }
+
+        logger.warn({ paused }, `entries ${paused ? 'paused' : 'resumed'} via telegram (${label})`);
+        return ctx.reply(`${paused ? '✅ Entries paused.' : '✅ Entries resumed.'}`);
+      } catch (e: any) {
+        logger.warn({ err: e?.message || String(e) }, `telegram ${label} error`);
+        return ctx.reply('Failed to update entries state.');
+      }
+    };
+
+    this.bot.command('pause_entries', (ctx) => setEntriesPaused(ctx, true, '/pause_entries'));
+    this.bot.command('resume_entries', (ctx) => setEntriesPaused(ctx, false, '/resume_entries'));
 
     // Panic = immediately stop new entries.
-    // (We’ll add "close all positions" once sell/exit management is implemented.)
-    this.bot.command('panic', (ctx) => {
-      runtimeFlags.entriesPaused = true;
-      return ctx.reply('🚨 PANIC: entries paused immediately.');
-    });
+    // (We’ll add "close all positions" later once exits are fully reliable.)
+    this.bot.command('panic', (ctx) => setEntriesPaused(ctx, true, '/panic'));
 
     this.bot.launch();
     logger.info('telegram bot started');
