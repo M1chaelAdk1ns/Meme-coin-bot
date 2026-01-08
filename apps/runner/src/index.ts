@@ -81,7 +81,6 @@ async function considerEntry(mint: string) {
   const trades = tradesByMint.get(mint) || [];
   const prices = pricesByMint.get(mint) || [];
 
-  // Prevent duplicates: DB check (ok for now; we’ll optimize to in-memory next)
   const tokenRow = storage.listOpenPositions().find((p) => p.mint === mint);
   if (tokenRow) return;
 
@@ -111,17 +110,30 @@ async function considerEntry(mint: string) {
   positions.set(pos.id, pos);
   alerts.notify('info', `Entering ${mint} size ${size.toFixed(2)} SOL (DRY_RUN=${env.DRY_RUN})`);
 
-  // DRY RUN or live disabled: just mark open
   if (env.DRY_RUN || !env.ENABLE_LIVE_TRADING) {
     fsm.transition(pos, 'OPEN');
     return;
   }
 
-  // Simulation gate (buy + sell) before real entry
+  const mintPk = new PublicKey(mint);
+
+  // Simulation gate: buy + small sell
   const gate = await transactionEngine.simulateBuySellGate({
     payer,
-    buildBuyTx: () => adapter.buildBuyTx({ payer: payer.publicKey, mint: new PublicKey(mint), amountSol: size }),
-    buildSellTx: () => adapter.buildSellTx({ payer: payer.publicKey, mint: new PublicKey(mint), amountSol: size * 0.2 })
+    buildBuyTx: () =>
+      adapter.buildBuyTx({
+        payer: payer.publicKey,
+        mint: mintPk,
+        amount: size,
+        denominatedInSol: true
+      }),
+    buildSellTx: () =>
+      adapter.buildSellTx({
+        payer: payer.publicKey,
+        mint: mintPk,
+        amount: '10%',
+        denominatedInSol: false
+      })
   });
 
   if (!gate.ok) {
@@ -131,7 +143,13 @@ async function considerEntry(mint: string) {
   }
 
   const result = await transactionEngine.sendWithRetry(
-    () => adapter.buildBuyTx({ payer: payer.publicKey, mint: new PublicKey(mint), amountSol: size }),
+    () =>
+      adapter.buildBuyTx({
+        payer: payer.publicKey,
+        mint: mintPk,
+        amount: size,
+        denominatedInSol: true
+      }),
     payer
   );
 
