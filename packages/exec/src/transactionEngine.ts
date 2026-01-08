@@ -1,6 +1,7 @@
 import {
   Connection,
   Keypair,
+  PublicKey,
   SendOptions,
   Transaction,
   TransactionSignature,
@@ -16,6 +17,17 @@ export type SimResult = {
   logs?: string[];
 };
 
+export type FillDeltas = {
+  ok: boolean;
+  signature: string;
+  // token delta for the given mint for payer-owned token accounts
+  tokenDelta?: number;
+  // SOL delta for payer (post - pre) in SOL; negative means spent
+  solDelta?: number;
+  feeLamports?: number;
+  err?: string;
+};
+
 function signTx(tx: AnyTx, payer: Keypair) {
   if (tx instanceof Transaction) {
     tx.sign(payer);
@@ -29,6 +41,19 @@ function serializeTx(tx: AnyTx): Uint8Array {
     return tx.serialize();
   }
   return tx.serialize();
+}
+
+// Extract account keys (supports legacy + v0)
+function getAccountKeys(tx: any): PublicKey[] {
+  try {
+    // VersionedTransaction
+    const msg = tx?.message;
+    if (msg?.staticAccountKeys?.length) return msg.staticAccountKeys as PublicKey[];
+    if (msg?.accountKeys?.length) return msg.accountKeys as PublicKey[];
+  } catch {
+    // ignore
+  }
+  return [];
 }
 
 export class TransactionEngine {
@@ -86,7 +111,6 @@ export class TransactionEngine {
         const connection = attempt === 1 ? this.connections[0] : this.nextConnection();
         const tx = await txBuilder();
 
-        // sign + send
         signTx(tx, payer);
         const raw = serializeTx(tx);
 
@@ -120,5 +144,128 @@ export class TransactionEngine {
     }
 
     return { confirmed: false, error: lastError, attempt: 3 };
+  }
+
+  /**
+   * Fetch a confirmed tx and compute:
+   * - payer SOL delta (post - pre) in SOL
+   * - payer token delta (post - pre) for a specific mint across payer-owned token accounts
+   *
+   * Notes:
+   * - Works for both legacy and v0 tx shapes (best-effort).
+   * - If RPC doesn't return token balances, tokenDelta may be undefined.
+   */
+  async getFillDeltas(params: {
+    signature: string;
+    payer: PublicKey;
+    mint?: PublicKey;
+    connection?: Connection;
+    maxWaitMs?: number;
+  }): Promise<FillDeltas> {
+    const connection = params.connection ?? this.connections[0];
+    const maxWaitMs = params.maxWaitMs ?? 5000;
+    const start = Date.now();
+
+    while (Date.now() - start < maxWaitMs) {
+      try {
+        const tx = await connection.getTransaction(params.signature, {
+          commitment: 'confirmed',
+          maxSupportedTransactionVersion: 0
+        } as any);
+
+        if (!tx || !tx.meta) {
+          // RPC may be slightly behind even after confirm
+          await sleep(200);
+          continue;
+        }
+
+        const meta: any = tx.meta;
+        const feeLamports: number | undefined = typeof meta.fee === 'number' ? meta.fee : undefined;
+
+        // payer SOL delta
+        let solDelta: number | undefined;
+        try {
+          const keys = getAccountKeys(tx.transaction);
+          const payerIndex = keys.findIndex((k) => k.toBase58() === params.payer.toBase58());
+          if (payerIndex >= 0 && Array.isArray(meta.preBalances) && Array.isArray(meta.postBalances)) {
+            const pre = meta.preBalances[payerIndex] ?? 0;
+            const post = meta.postBalances[payerIndex] ?? 0;
+            solDelta = (post - pre) / 1e9;
+          }
+        } catch {
+          // ignore
+        }
+
+        // payer token delta (sum across payer-owned token accounts for the mint)
+        let tokenDelta: number | undefined;
+        if (params.mint && Array.isArray(meta.preTokenBalances) && Array.isArray(meta.postTokenBalances)) {
+          const mintStr = params.mint.toBase58();
+          const payerStr = params.payer.toBase58();
+
+          const sumTokenUi = (arr: any[]) =>
+            arr
+              .filter((b) => b && b.mint === mintStr && b.owner === payerStr)
+              .reduce((acc, b) => {
+                const ui = b.uiTokenAmount?.uiAmount;
+                if (typeof ui === 'number') return acc + ui;
+                // fallback: amount string / decimals
+                const amtStr = b.uiTokenAmount?.amount;
+                const dec = b.uiTokenAmount?.decimals;
+                if (typeof amtStr === 'string' && typeof dec === 'number') {
+                  const amt = Number(amtStr);
+                  if (Number.isFinite(amt)) return acc + amt / Math.pow(10, dec);
+                }
+                return acc;
+              }, 0);
+
+          const preSum = sumTokenUi(meta.preTokenBalances);
+          const postSum = sumTokenUi(meta.postTokenBalances);
+          tokenDelta = postSum - preSum;
+        }
+
+        return {
+          ok: true,
+          signature: params.signature,
+          tokenDelta,
+          solDelta,
+          feeLamports
+        };
+      } catch (e: any) {
+        // transient RPC errors: keep trying within window
+        const msg = e?.message || String(e);
+        await sleep(200);
+        if (Date.now() - start >= maxWaitMs) {
+          return { ok: false, signature: params.signature, err: msg };
+        }
+      }
+    }
+
+    return { ok: false, signature: params.signature, err: 'getTransaction timed out (RPC lag?)' };
+  }
+
+  /**
+   * Convenience helper:
+   * - sendWithRetry()
+   * - then fetch deltas from chain for payer + (optional) mint
+   */
+  async sendWithRetryAndFetchFill(params: {
+    txBuilder: () => Promise<AnyTx>;
+    payer: Keypair;
+    mint?: PublicKey;
+    connection?: Connection;
+    maxWaitMs?: number;
+  }): Promise<{ exec: ExecutionResult; fill?: FillDeltas }> {
+    const exec = await this.sendWithRetry(params.txBuilder, params.payer);
+    if (!exec.confirmed || !exec.signature) return { exec };
+
+    const fill = await this.getFillDeltas({
+      signature: exec.signature,
+      payer: params.payer.publicKey,
+      mint: params.mint,
+      connection: params.connection,
+      maxWaitMs: params.maxWaitMs
+    });
+
+    return { exec, fill };
   }
 }
