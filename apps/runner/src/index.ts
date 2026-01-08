@@ -30,6 +30,14 @@ const tradesByMint = new Map<string, TradeEvent[]>();
 const pricesByMint = new Map<string, number[]>();
 const positions = new Map<string, Position>();
 
+// In-memory caches to avoid DB scans in hot paths
+const tokenInfoByMint = new Map<string, TokenInfo>();
+const openMints = new Set<string>();
+
+// Throttle considerEntry per mint (prevents spamming on high trade velocity)
+const lastConsiderByMint = new Map<string, number>();
+const CONSIDER_COOLDOWN_MS = 750;
+
 function recordTrade(event: TradeEvent) {
   const arr = tradesByMint.get(event.mint) || [];
   arr.push(event);
@@ -41,6 +49,13 @@ function recordPrice(mint: string, price: number) {
   const arr = pricesByMint.get(mint) || [];
   arr.push(price);
   pricesByMint.set(mint, arr.slice(-200));
+}
+
+function refreshOpenMintsFromDb() {
+  openMints.clear();
+  for (const p of storage.listOpenPositions()) {
+    openMints.add(p.mint);
+  }
 }
 
 async function assertWalletReady() {
@@ -61,6 +76,9 @@ async function assertWalletReady() {
   if (env.ENABLE_LIVE_TRADING && !env.DRY_RUN) {
     alerts.notify('warn', 'LIVE TRADING ENABLED. Double-check your settings.');
   }
+
+  // Initialize open mints cache once on startup
+  refreshOpenMintsFromDb();
 }
 
 async function handleNewToken(msg: any) {
@@ -71,22 +89,33 @@ async function handleNewToken(msg: any) {
     freezeAuthority: msg.freezeAuthority,
     mintAuthority: msg.mintAuthority
   };
+
+  tokenInfoByMint.set(token.mint, token);
   storage.upsertToken(token);
+
   alerts.notify('info', `New token detected ${token.mint}`);
 }
 
 async function considerEntry(mint: string) {
   if (runtimeFlags.entriesPaused) return;
 
+  // cooldown per mint to avoid calling repeatedly
+  const now = Date.now();
+  const last = lastConsiderByMint.get(mint) || 0;
+  if (now - last < CONSIDER_COOLDOWN_MS) return;
+  lastConsiderByMint.set(mint, now);
+
   const trades = tradesByMint.get(mint) || [];
   const prices = pricesByMint.get(mint) || [];
 
-  const tokenRow = storage.listOpenPositions().find((p) => p.mint === mint);
-  if (tokenRow) return;
+  // prevent duplicate entries (fast path)
+  if (openMints.has(mint)) return;
 
   if (trades.length < 5) return;
 
-  const risk = riskEngine.evaluate({ token: { mint, creator: 'unknown' }, recentTrades: trades.slice(-30) });
+  const token = tokenInfoByMint.get(mint) || { mint, creator: 'unknown', decimals: 6 };
+
+  const risk = riskEngine.evaluate({ token, recentTrades: trades.slice(-30) });
   storage.saveRiskReport(mint, risk);
 
   if (!risk.allow) {
@@ -108,6 +137,8 @@ async function considerEntry(mint: string) {
   );
 
   positions.set(pos.id, pos);
+  openMints.add(mint);
+
   alerts.notify('info', `Entering ${mint} size ${size.toFixed(2)} SOL (DRY_RUN=${env.DRY_RUN})`);
 
   if (env.DRY_RUN || !env.ENABLE_LIVE_TRADING) {
@@ -139,6 +170,7 @@ async function considerEntry(mint: string) {
   if (!gate.ok) {
     alerts.notify('warn', `Sim gate blocked ${mint}: ${gate.reason}`);
     fsm.transition(pos, 'CLOSED');
+    openMints.delete(mint);
     return;
   }
 
@@ -158,6 +190,7 @@ async function considerEntry(mint: string) {
   } else {
     alerts.notify('error', `Entry failed ${mint}: ${result.error}`);
     fsm.transition(pos, 'CLOSED');
+    openMints.delete(mint);
   }
 }
 
