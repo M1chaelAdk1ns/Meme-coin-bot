@@ -53,8 +53,8 @@ export class Storage {
       );
     `);
 
-    // Lightweight migrations (SQLite doesn’t have IF NOT EXISTS for columns reliably)
     this.ensureColumn('positions', 'entrySignature', 'TEXT');
+    this.ensureColumn('positions', 'exitSignature', 'TEXT');
     this.ensureColumn('positions', 'entryTimestamp', 'INTEGER');
     this.ensureColumn('positions', 'lastError', 'TEXT');
     this.ensureColumn('positions', 'tpFilled', 'INTEGER');
@@ -108,13 +108,13 @@ export class Storage {
         `INSERT OR REPLACE INTO positions(
           id, mint, state, sizeSol, tokens, entryPrice, stopLossPct, takeProfits, trailMode,
           createdAt, updatedAt,
-          entrySignature, entryTimestamp, lastError,
+          entrySignature, exitSignature, entryTimestamp, lastError,
           tpFilled, peakPnlPct
         )
         VALUES (
           @id, @mint, @state, @sizeSol, @tokens, @entryPrice, @stopLossPct, @takeProfits, @trailMode,
           @createdAt, @updatedAt,
-          @entrySignature, @entryTimestamp, @lastError,
+          @entrySignature, @exitSignature, @entryTimestamp, @lastError,
           @tpFilled, @peakPnlPct
         )`
       )
@@ -122,7 +122,7 @@ export class Storage {
         ...pos,
         takeProfits: JSON.stringify(pos.takeProfits ?? []),
         tpFilled: pos.tpFilled ?? 0,
-        peakPnlPct: pos.peakPnlPct ?? null
+        peakPnlPct: typeof pos.peakPnlPct === 'number' ? pos.peakPnlPct : null
       });
   }
 
