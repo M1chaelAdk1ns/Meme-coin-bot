@@ -302,9 +302,9 @@ async function considerEntry(mint: string) {
     env.TRAIL_MODE
   );
 
-  // set entry price immediately from last seen price (best we can do without fills)
-  const entryPx = prices.length ? prices[prices.length - 1] : undefined;
-  if (entryPx) pos.entryPrice = entryPx;
+  // fallback entry price from last portal price (will be overwritten by real fill if available)
+  const entryPxFallback = prices.length ? prices[prices.length - 1] : undefined;
+  if (entryPxFallback) pos.entryPrice = entryPxFallback;
 
   positions.set(pos.id, pos);
   openMints.add(mint);
@@ -343,22 +343,51 @@ async function considerEntry(mint: string) {
     return;
   }
 
-  const result = await transactionEngine.sendWithRetry(
-    () =>
+  // Send buy, then fetch real deltas
+  const { exec, fill } = await transactionEngine.sendWithRetryAndFetchFill({
+    txBuilder: () =>
       adapter.buildBuyTx({
         payer: payer.publicKey,
         mint: mintPk,
         amount: size,
         denominatedInSol: true
       }),
-    payer
-  );
+    payer,
+    mint: mintPk,
+    maxWaitMs: 6000
+  });
 
-  if (result.confirmed) {
-    fsm.transition(pos, 'OPEN', { entrySignature: result.signature });
+  if (exec.confirmed && exec.signature) {
+    // Try to compute accurate fill
+    if (fill?.ok) {
+      const tokens = typeof fill.tokenDelta === 'number' ? fill.tokenDelta : undefined;
+      const solDelta = typeof fill.solDelta === 'number' ? fill.solDelta : undefined;
+
+      // solDelta is post - pre; for a buy it should be negative (spent)
+      const solSpent = typeof solDelta === 'number' ? -solDelta : undefined;
+
+      if (tokens && tokens > 0 && solSpent && solSpent > 0) {
+        pos.tokens = tokens;
+        pos.entryPrice = solSpent / tokens;
+        storage.savePosition(pos);
+        alerts.notify(
+          'info',
+          `Fill: ${mint} spent ${solSpent.toFixed(4)} SOL, got ${tokens.toFixed(4)} tokens, entry ~ ${pos.entryPrice.toFixed(8)} SOL/token`
+        );
+      } else {
+        alerts.notify(
+          'warn',
+          `Fill parse incomplete for ${mint} (tokens=${tokens ?? 'n/a'}, solSpent=${solSpent ?? 'n/a'}). Using fallback entryPrice.`
+        );
+      }
+    } else if (fill && !fill.ok) {
+      alerts.notify('warn', `Fill fetch failed for ${mint}: ${fill.err}. Using fallback entryPrice.`);
+    }
+
+    fsm.transition(pos, 'OPEN', { entrySignature: exec.signature });
   } else {
-    alerts.notify('error', `Entry failed ${mint}: ${result.error}`);
-    fsm.transition(pos, 'CLOSED', { error: result.error });
+    alerts.notify('error', `Entry failed ${mint}: ${exec.error}`);
+    fsm.transition(pos, 'CLOSED', { error: exec.error });
     openMints.delete(mint);
   }
 }
