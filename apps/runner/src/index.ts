@@ -34,9 +34,16 @@ const positions = new Map<string, Position>();
 const tokenInfoByMint = new Map<string, TokenInfo>();
 const openMints = new Set<string>();
 
-// Throttle considerEntry per mint (prevents spamming on high trade velocity)
+// Throttle considerEntry per mint
 const lastConsiderByMint = new Map<string, number>();
 const CONSIDER_COOLDOWN_MS = 750;
+
+// Throttle exits per mint so we don’t double-sell if ticks come in fast
+const lastExitActionByMint = new Map<string, number>();
+const EXIT_COOLDOWN_MS = 1200;
+
+// Trailing giveback (simple, effective): if peak pnl was high then dumps hard, exit remainder
+const TRAIL_GIVEBACK_PCT = 0.20; // 20% absolute giveback (ex: peak +0.70 then falls to +0.50 => exit)
 
 function recordTrade(event: TradeEvent) {
   const arr = tradesByMint.get(event.mint) || [];
@@ -55,6 +62,7 @@ function refreshOpenMintsFromDb() {
   openMints.clear();
   for (const p of storage.listOpenPositions()) {
     openMints.add(p.mint);
+    positions.set(p.id, p);
   }
 }
 
@@ -77,7 +85,6 @@ async function assertWalletReady() {
     alerts.notify('warn', 'LIVE TRADING ENABLED. Double-check your settings.');
   }
 
-  // Initialize open mints cache once on startup
   refreshOpenMintsFromDb();
 }
 
@@ -92,14 +99,173 @@ async function handleNewToken(msg: any) {
 
   tokenInfoByMint.set(token.mint, token);
   storage.upsertToken(token);
-
   alerts.notify('info', `New token detected ${token.mint}`);
+}
+
+function latestPrice(mint: string): number | undefined {
+  const arr = pricesByMint.get(mint);
+  if (!arr || !arr.length) return undefined;
+  return arr[arr.length - 1];
+}
+
+function pnlPct(pos: Position, px: number): number | undefined {
+  if (!pos.entryPrice || pos.entryPrice <= 0) return undefined;
+  return (px - pos.entryPrice) / pos.entryPrice;
+}
+
+async function executeSellPercent(mint: string, percent: string): Promise<{ ok: boolean; err?: string; sig?: string }> {
+  if (env.DRY_RUN || !env.ENABLE_LIVE_TRADING) {
+    return { ok: true };
+  }
+
+  const mintPk = new PublicKey(mint);
+
+  const res = await transactionEngine.sendWithRetry(
+    () =>
+      adapter.buildSellTx({
+        payer: payer.publicKey,
+        mint: mintPk,
+        amount: percent,
+        denominatedInSol: false
+      }),
+    payer
+  );
+
+  if (!res.confirmed) return { ok: false, err: res.error };
+  return { ok: true, sig: res.signature };
+}
+
+async function manageExitsTick() {
+  const open = storage.listOpenPositions().filter((p) => p.state === 'OPEN');
+  for (const pos of open) {
+    const px = latestPrice(pos.mint);
+    if (!px) continue;
+
+    // ensure we have an entry price (first tick after OPEN)
+    if (!pos.entryPrice) {
+      pos.entryPrice = px;
+      storage.savePosition(pos);
+      continue;
+    }
+
+    const pnl = pnlPct(pos, px);
+    if (pnl === undefined) continue;
+
+    // peak tracking
+    const peak = typeof pos.peakPnlPct === 'number' ? pos.peakPnlPct : pnl;
+    if (pnl > peak) pos.peakPnlPct = pnl;
+
+    // time stop
+    const openTs = pos.entryTimestamp ?? pos.createdAt;
+    const ageSec = (Date.now() - openTs) / 1000;
+    if (ageSec >= env.TIME_STOP_SEC) {
+      const last = lastExitActionByMint.get(pos.mint) || 0;
+      if (Date.now() - last < EXIT_COOLDOWN_MS) continue;
+      lastExitActionByMint.set(pos.mint, Date.now());
+
+      alerts.notify('warn', `TIME STOP: exiting ${pos.mint} age=${ageSec.toFixed(0)}s pnl=${(pnl * 100).toFixed(1)}%`);
+      fsm.transition(pos, 'PENDING_EXIT');
+
+      const sell = await executeSellPercent(pos.mint, '100%');
+      if (!sell.ok) {
+        fsm.transition(pos, 'OPEN', { error: sell.err });
+        continue;
+      }
+
+      fsm.transition(pos, 'CLOSED', { entrySignature: sell.sig });
+      openMints.delete(pos.mint);
+      continue;
+    }
+
+    // stop loss
+    if (pnl <= -pos.stopLossPct) {
+      const last = lastExitActionByMint.get(pos.mint) || 0;
+      if (Date.now() - last < EXIT_COOLDOWN_MS) continue;
+      lastExitActionByMint.set(pos.mint, Date.now());
+
+      alerts.notify('warn', `STOP LOSS: exiting ${pos.mint} pnl=${(pnl * 100).toFixed(1)}%`);
+      fsm.transition(pos, 'PENDING_EXIT');
+
+      const sell = await executeSellPercent(pos.mint, '100%');
+      if (!sell.ok) {
+        fsm.transition(pos, 'OPEN', { error: sell.err });
+        continue;
+      }
+
+      fsm.transition(pos, 'CLOSED', { entrySignature: sell.sig });
+      openMints.delete(pos.mint);
+      continue;
+    }
+
+    // trailing giveback (only after meaningful profit)
+    const peakNow = typeof pos.peakPnlPct === 'number' ? pos.peakPnlPct : pnl;
+    if (peakNow >= 0.35 && peakNow - pnl >= TRAIL_GIVEBACK_PCT) {
+      const last = lastExitActionByMint.get(pos.mint) || 0;
+      if (Date.now() - last < EXIT_COOLDOWN_MS) continue;
+      lastExitActionByMint.set(pos.mint, Date.now());
+
+      alerts.notify(
+        'warn',
+        `TRAIL EXIT: ${pos.mint} peak=${(peakNow * 100).toFixed(1)}% now=${(pnl * 100).toFixed(1)}%`
+      );
+      fsm.transition(pos, 'PENDING_EXIT');
+
+      const sell = await executeSellPercent(pos.mint, '100%');
+      if (!sell.ok) {
+        fsm.transition(pos, 'OPEN', { error: sell.err });
+        continue;
+      }
+
+      fsm.transition(pos, 'CLOSED', { entrySignature: sell.sig });
+      openMints.delete(pos.mint);
+      continue;
+    }
+
+    // TP ladder
+    const tpFilled = pos.tpFilled ?? 0;
+    const ladder = pos.takeProfits ?? [];
+    const next = ladder[tpFilled];
+
+    if (next) {
+      const target = next.profit; // interpreted as pnl threshold, e.g. 0.3 = +30%
+      if (pnl >= target) {
+        const last = lastExitActionByMint.get(pos.mint) || 0;
+        if (Date.now() - last < EXIT_COOLDOWN_MS) continue;
+        lastExitActionByMint.set(pos.mint, Date.now());
+
+        const pctToSell = Math.round(next.pct * 100);
+        const sellStr = `${pctToSell}%`;
+
+        alerts.notify('info', `TP HIT: ${pos.mint} pnl=${(pnl * 100).toFixed(1)}% -> sell ${sellStr}`);
+        fsm.transition(pos, 'PENDING_EXIT');
+
+        const sell = await executeSellPercent(pos.mint, sellStr);
+        if (!sell.ok) {
+          // keep it open and try later
+          fsm.transition(pos, 'OPEN', { error: sell.err });
+          continue;
+        }
+
+        // Mark TP step filled
+        pos.tpFilled = tpFilled + 1;
+        storage.savePosition(pos);
+
+        // return to OPEN for next steps
+        fsm.transition(pos, 'OPEN');
+
+        // If that was the last step, we can optionally close remainder based on your design.
+        // For now we leave remainder running with trailing/stop/time.
+      }
+    }
+
+    // persist peak updates occasionally
+    storage.savePosition(pos);
+  }
 }
 
 async function considerEntry(mint: string) {
   if (runtimeFlags.entriesPaused) return;
 
-  // cooldown per mint to avoid calling repeatedly
   const now = Date.now();
   const last = lastConsiderByMint.get(mint) || 0;
   if (now - last < CONSIDER_COOLDOWN_MS) return;
@@ -108,9 +274,7 @@ async function considerEntry(mint: string) {
   const trades = tradesByMint.get(mint) || [];
   const prices = pricesByMint.get(mint) || [];
 
-  // prevent duplicate entries (fast path)
   if (openMints.has(mint)) return;
-
   if (trades.length < 5) return;
 
   const token = tokenInfoByMint.get(mint) || { mint, creator: 'unknown', decimals: 6 };
@@ -136,6 +300,10 @@ async function considerEntry(mint: string) {
     env.TRAIL_MODE
   );
 
+  // set entry price immediately from last seen price (best we can do without fills)
+  const entryPx = prices.length ? prices[prices.length - 1] : undefined;
+  if (entryPx) pos.entryPrice = entryPx;
+
   positions.set(pos.id, pos);
   openMints.add(mint);
 
@@ -148,7 +316,6 @@ async function considerEntry(mint: string) {
 
   const mintPk = new PublicKey(mint);
 
-  // Simulation gate: buy + small sell
   const gate = await transactionEngine.simulateBuySellGate({
     payer,
     buildBuyTx: () =>
@@ -246,6 +413,14 @@ telegram.start(async () => {
 
 (async () => {
   await assertWalletReady();
+
+  // Exit manager loop
+  setInterval(() => {
+    void manageExitsTick().catch((e) => {
+      alerts.notify('error', `exit manager error: ${e?.message || e}`);
+    });
+  }, 1000);
+
   startFeed();
 })().catch((e) => {
   alerts.notify('error', `Startup failed: ${e?.message || e}`);
