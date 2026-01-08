@@ -137,9 +137,12 @@ async function executeSellPercent(mint: string, percent: string): Promise<{ ok: 
 
 async function manageExitsTick() {
   const open = storage.listOpenPositions().filter((p) => p.state === 'OPEN');
+
   for (const pos of open) {
     const px = latestPrice(pos.mint);
     if (!px) continue;
+
+    let dirty = false;
 
     // ensure we have an entry price (first tick after OPEN)
     if (!pos.entryPrice) {
@@ -152,8 +155,12 @@ async function manageExitsTick() {
     if (pnl === undefined) continue;
 
     // peak tracking
-    const peak = typeof pos.peakPnlPct === 'number' ? pos.peakPnlPct : pnl;
-    if (pnl > peak) pos.peakPnlPct = pnl;
+    const prevPeak = typeof pos.peakPnlPct === 'number' ? pos.peakPnlPct : undefined;
+    const peakBase = typeof prevPeak === 'number' ? prevPeak : pnl;
+    if (pnl > peakBase) {
+      pos.peakPnlPct = pnl;
+      dirty = true;
+    }
 
     // time stop
     const openTs = pos.entryTimestamp ?? pos.createdAt;
@@ -172,7 +179,7 @@ async function manageExitsTick() {
         continue;
       }
 
-      fsm.transition(pos, 'CLOSED', { entrySignature: sell.sig });
+      fsm.transition(pos, 'CLOSED', { exitSignature: sell.sig });
       openMints.delete(pos.mint);
       continue;
     }
@@ -192,7 +199,7 @@ async function manageExitsTick() {
         continue;
       }
 
-      fsm.transition(pos, 'CLOSED', { entrySignature: sell.sig });
+      fsm.transition(pos, 'CLOSED', { exitSignature: sell.sig });
       openMints.delete(pos.mint);
       continue;
     }
@@ -216,7 +223,7 @@ async function manageExitsTick() {
         continue;
       }
 
-      fsm.transition(pos, 'CLOSED', { entrySignature: sell.sig });
+      fsm.transition(pos, 'CLOSED', { exitSignature: sell.sig });
       openMints.delete(pos.mint);
       continue;
     }
@@ -227,7 +234,7 @@ async function manageExitsTick() {
     const next = ladder[tpFilled];
 
     if (next) {
-      const target = next.profit; // interpreted as pnl threshold, e.g. 0.3 = +30%
+      const target = next.profit; // pnl threshold, e.g. 0.3 = +30%
       if (pnl >= target) {
         const last = lastExitActionByMint.get(pos.mint) || 0;
         if (Date.now() - last < EXIT_COOLDOWN_MS) continue;
@@ -241,25 +248,20 @@ async function manageExitsTick() {
 
         const sell = await executeSellPercent(pos.mint, sellStr);
         if (!sell.ok) {
-          // keep it open and try later
           fsm.transition(pos, 'OPEN', { error: sell.err });
           continue;
         }
 
-        // Mark TP step filled
         pos.tpFilled = tpFilled + 1;
-        storage.savePosition(pos);
+        dirty = true;
 
-        // return to OPEN for next steps
         fsm.transition(pos, 'OPEN');
-
-        // If that was the last step, we can optionally close remainder based on your design.
-        // For now we leave remainder running with trailing/stop/time.
       }
     }
 
-    // persist peak updates occasionally
-    storage.savePosition(pos);
+    if (dirty) {
+      storage.savePosition(pos);
+    }
   }
 }
 
